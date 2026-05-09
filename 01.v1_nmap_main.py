@@ -21,6 +21,7 @@ import json
 import logging
 import subprocess
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Optional
 
@@ -138,6 +139,206 @@ def check_root() -> bool:
         logger.warning("Privilege error: root-required scan was attempted without sudo.")
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Quick Summary Parser
+# ---------------------------------------------------------------------------
+
+# Risk seviyesi: port numarasına göre ön tanımlı notlar
+_PORT_NOTES: dict[int, tuple[str, str]] = {
+    21:   ("FTP",         "Cleartext credentials, anonymous login possible"),
+    22:   ("SSH",         "Brute-force / outdated version exploits"),
+    23:   ("Telnet",      "Cleartext protocol — highly insecure"),
+    25:   ("SMTP",        "Open relay, user enumeration"),
+    53:   ("DNS",         "Zone transfer (AXFR), amplification attacks"),
+    80:   ("HTTP",        "SQLi, XSS, Path Traversal, Host Header injection"),
+    110:  ("POP3",        "Cleartext credentials"),
+    111:  ("RPCbind",     "NFS enumeration"),
+    135:  ("MSRPC",       "Windows RPC exploitation"),
+    139:  ("NetBIOS",     "SMB enumeration, EternalBlue"),
+    443:  ("HTTPS",       "TLS misconfiguration, weak ciphers, web app vulns"),
+    445:  ("SMB",         "EternalBlue (MS17-010), relay attacks"),
+    1433: ("MSSQL",       "SA brute-force, xp_cmdshell"),
+    1521: ("Oracle DB",   "Default credentials, TNS listener poisoning"),
+    3306: ("MySQL",       "Remote root login, UDF exploitation"),
+    3389: ("RDP",         "BlueKeep (CVE-2019-0708), brute-force"),
+    5432: ("PostgreSQL",  "Default credentials, COPY TO/FROM exploit"),
+    5900: ("VNC",         "No-auth mode, weak password"),
+    6379: ("Redis",       "No-auth RCE, config overwrite"),
+    8080: ("HTTP-Alt",    "Proxy bypass, web app vulns"),
+    8443: ("HTTPS-Alt",   "Same as 443 with admin panel exposure"),
+    27017:("MongoDB",     "No-auth access, data exfiltration"),
+}
+
+_RISK_PRIORITY: dict[int, str] = {
+    # port: risk rengi
+    21: Colors.RED, 23: Colors.RED, 139: Colors.RED, 445: Colors.RED,
+    3389: Colors.RED, 6379: Colors.RED, 27017: Colors.RED,
+    22: Colors.YELLOW, 25: Colors.YELLOW, 53: Colors.YELLOW,
+    80: Colors.YELLOW, 110: Colors.YELLOW, 443: Colors.YELLOW,
+    3306: Colors.YELLOW, 5432: Colors.YELLOW, 5900: Colors.YELLOW,
+}
+
+
+def print_quick_summary(scan_id: str, target: str, xml_output: str) -> None:
+    """
+    Parse Nmap XML output and print a concise pentester-style summary.
+
+    Displays:
+    - Open ports with service name and version
+    - Risk note per port (from the built-in knowledge base)
+    - OS detection best guess (if available)
+    - Uptime hint (if available)
+    - Suggested first-strike port
+
+    Args:
+        scan_id:    The unique ID of the completed scan (for display only).
+        target:     The scanned host IP or hostname.
+        xml_output: Raw Nmap XML string captured from stdout.
+    """
+    width = 52
+    border = Colors.MAGENTA + Colors.BOLD + "═" * width + Colors.RESET
+
+    print(f"\n{border}")
+    print(f"  {Colors.BOLD}{Colors.WHITE}QUICK SCAN SUMMARY{Colors.RESET}  "
+          f"{Colors.DIM}[ID:{scan_id}]  {target}{Colors.RESET}")
+    print(f"{border}\n")
+
+    try:
+        root = ET.fromstring(xml_output)
+    except ET.ParseError:
+        _print(Colors.YELLOW, "[~]", "XML could not be parsed — summary skipped.")
+        return
+
+    open_ports: list[dict] = []
+
+    for host in root.findall("host"):
+        ports_elem = host.find("ports")
+        if ports_elem is None:
+            continue
+
+        for port_elem in ports_elem.findall("port"):
+            state_elem = port_elem.find("state")
+            if state_elem is None or state_elem.get("state") != "open":
+                continue
+
+            portid   = int(port_elem.get("portid", 0))
+            protocol = port_elem.get("protocol", "tcp")
+            service  = port_elem.find("service")
+            svc_name = service.get("name", "unknown")    if service is not None else "unknown"
+            svc_ver  = service.get("version", "")        if service is not None else ""
+            svc_prod = service.get("product", "")        if service is not None else ""
+
+            open_ports.append({
+                "port": portid,
+                "proto": protocol,
+                "service": svc_name,
+                "product": svc_prod,
+                "version": svc_ver,
+            })
+
+    # --- Section 1: Open Ports ---
+    if not open_ports:
+        _print(Colors.YELLOW, "[~]", "No open ports detected in this scan.")
+    else:
+        print(f"  {Colors.BOLD}{'PORT':<8}{'PROTO':<7}{'SERVICE':<14}{'PRODUCT / VERSION'}{Colors.RESET}")
+        print(f"  {'─'*8}{'─'*7}{'─'*14}{'─'*22}")
+
+        for p in sorted(open_ports, key=lambda x: x["port"]):
+            risk_color = _RISK_PRIORITY.get(p["port"], Colors.GREEN)
+            full_ver   = f"{p['product']} {p['version']}".strip() or "—"
+            print(
+                f"  {risk_color}{Colors.BOLD}{p['port']:<8}{Colors.RESET}"
+                f"{Colors.DIM}{p['proto']:<7}{Colors.RESET}"
+                f"{Colors.CYAN}{p['service']:<14}{Colors.RESET}"
+                f"{full_ver}"
+            )
+
+            note_tuple = _PORT_NOTES.get(p["port"])
+            if note_tuple:
+                print(f"  {Colors.DIM}{'':8}{'':7}↳ Risk: {note_tuple[1]}{Colors.RESET}")
+
+        print()
+
+    # --- Section 2: OS Detection ---
+    os_matches = root.findall(".//osmatch")
+    if os_matches:
+        best = max(os_matches, key=lambda x: int(x.get("accuracy", "0")))
+        accuracy = best.get("accuracy", "?")
+        os_name  = best.get("name", "Unknown")
+        print(f"  {Colors.BOLD}OS Guess :{Colors.RESET} {Colors.GREEN}{os_name}{Colors.RESET} "
+              f"{Colors.DIM}({accuracy}% confidence){Colors.RESET}")
+    else:
+        print(f"  {Colors.BOLD}OS Guess :{Colors.RESET} {Colors.DIM}Not available "
+              f"(run with -O or -A as root){Colors.RESET}")
+
+    # --- Section 3: Uptime ---
+    uptime_elem = root.find(".//uptime")
+    if uptime_elem is not None:
+        seconds   = int(uptime_elem.get("seconds", 0))
+        days      = seconds // 86400
+        hours     = (seconds % 86400) // 3600
+        last_boot = uptime_elem.get("lastboot", "")
+        uptime_str = f"{days}d {hours}h"
+        patch_note = (
+            f"{Colors.RED}  ← No recent reboot; patches may be missing!{Colors.RESET}"
+            if days > 7 else ""
+        )
+        print(f"  {Colors.BOLD}Uptime   :{Colors.RESET} {uptime_str}{patch_note}")
+        if last_boot:
+            print(f"  {Colors.BOLD}Last Boot:{Colors.RESET} {Colors.DIM}{last_boot}{Colors.RESET}")
+    else:
+        print(f"  {Colors.BOLD}Uptime   :{Colors.RESET} {Colors.DIM}Not available{Colors.RESET}")
+
+    # --- Section 4: First-Strike Recommendation ---
+    print(f"\n  {Colors.BOLD}{'─'*48}{Colors.RESET}")
+    _suggest_first_strike(open_ports)
+
+    print(f"\n{border}\n")
+
+
+def _suggest_first_strike(open_ports: list[dict]) -> None:
+    """
+    Print a short first-strike recommendation based on open ports.
+
+    Priority order (descending): web (80/443/8080/8443) → SMB (445/139) →
+    DB (3306/5432/1433/27017/6379) → RDP (3389) → SSH (22) → first open port.
+
+    Args:
+        open_ports: List of dicts produced by print_quick_summary.
+    """
+    if not open_ports:
+        return
+
+    port_nums  = {p["port"] for p in open_ports}
+    priorities = [
+        (80,    "HTTP",       "Web apps carry the most developer mistakes (SQLi, XSS, Auth bypass)."),
+        (443,   "HTTPS",      "Encrypted but same web attack surface — check TLS config too."),
+        (8080,  "HTTP-Alt",   "Often an admin panel or dev server with weaker protections."),
+        (8443,  "HTTPS-Alt",  "Admin interfaces frequently exposed here."),
+        (445,   "SMB",        "MS17-010 / EternalBlue is still unpatched on many systems."),
+        (139,   "NetBIOS",    "SMB enumeration gateway — credential relay potential."),
+        (3306,  "MySQL",      "Remote root or UDF code execution if misconfigured."),
+        (6379,  "Redis",      "Unauthenticated Redis = instant RCE via config overwrite."),
+        (27017, "MongoDB",    "No-auth MongoDB exposes full database with zero effort."),
+        (1433,  "MSSQL",      "xp_cmdshell can give OS-level code execution."),
+        (3389,  "RDP",        "BlueKeep or credential stuffing — juicy target."),
+        (22,    "SSH",        "Last resort: brute-force or check for default credentials."),
+    ]
+
+    for port, name, reason in priorities:
+        if port in port_nums:
+            print(f"  {Colors.BOLD}{Colors.MAGENTA}First Strike →{Colors.RESET} "
+                  f"{Colors.YELLOW}Port {port} ({name}){Colors.RESET}")
+            print(f"  {Colors.DIM}  Reason: {reason}{Colors.RESET}")
+            return
+
+    # Fallback: lowest open port
+    first = sorted(open_ports, key=lambda x: x["port"])[0]
+    print(f"  {Colors.BOLD}{Colors.MAGENTA}First Strike →{Colors.RESET} "
+          f"{Colors.YELLOW}Port {first['port']} ({first['service']}){Colors.RESET}")
+    print(f"  {Colors.DIM}  Reason: Only open port — start enumeration here.{Colors.RESET}")
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +462,9 @@ def run_nmap_scan(target: str, extra_args: str, scan_label: str = "Custom Scan")
                 "[ID:%s] Scanning finished for %s | status=success | %s",
                 scan_id, target, summary,
             )
+
+            # Print inline pentester summary immediately after scan
+            print_quick_summary(scan_id, target, stdout)
 
         else:
             result_entry["status"] = "error"
