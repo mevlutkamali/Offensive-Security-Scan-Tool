@@ -181,23 +181,25 @@ _RISK_PRIORITY: dict[int, str] = {
 }
 
 
-def print_quick_summary(scan_id: str, target: str, xml_output: str) -> None:
+def print_quick_summary(scan_id: str, target: str, parsed: dict) -> None:
     """
-    Parse Nmap XML output and print a concise pentester-style summary.
+    Print a concise pentester-style summary from already-parsed scan data.
+
+    Accepts the structured dict produced by _parse_xml_to_structured so that
+    XML is never re-parsed and never reaches this layer.
 
     Displays:
-    - Open ports with service name and version
-    - Risk note per port (from the built-in knowledge base)
-    - OS detection best guess (if available)
-    - Uptime hint (if available)
-    - Suggested first-strike port
+    - Open ports with service, version, and inline risk notes
+    - OS detection best guess and confidence
+    - Host latency and status
+    - Suggested first-strike port with rationale
 
     Args:
-        scan_id:    The unique ID of the completed scan (for display only).
-        target:     The scanned host IP or hostname.
-        xml_output: Raw Nmap XML string captured from stdout.
+        scan_id: Unique ID of the completed scan (display only).
+        target:  Scanned host IP or hostname.
+        parsed:  Dict returned by _parse_xml_to_structured().
     """
-    width = 52
+    width  = 52
     border = Colors.MAGENTA + Colors.BOLD + "═" * width + Colors.RESET
 
     print(f"\n{border}")
@@ -205,97 +207,187 @@ def print_quick_summary(scan_id: str, target: str, xml_output: str) -> None:
           f"{Colors.DIM}[ID:{scan_id}]  {target}{Colors.RESET}")
     print(f"{border}\n")
 
-    try:
-        root = ET.fromstring(xml_output)
-    except ET.ParseError:
-        _print(Colors.YELLOW, "[~]", "XML could not be parsed — summary skipped.")
-        return
-
-    open_ports: list[dict] = []
-
-    for host in root.findall("host"):
-        ports_elem = host.find("ports")
-        if ports_elem is None:
-            continue
-
-        for port_elem in ports_elem.findall("port"):
-            state_elem = port_elem.find("state")
-            if state_elem is None or state_elem.get("state") != "open":
-                continue
-
-            portid   = int(port_elem.get("portid", 0))
-            protocol = port_elem.get("protocol", "tcp")
-            service  = port_elem.find("service")
-            svc_name = service.get("name", "unknown")    if service is not None else "unknown"
-            svc_ver  = service.get("version", "")        if service is not None else ""
-            svc_prod = service.get("product", "")        if service is not None else ""
-
-            open_ports.append({
-                "port": portid,
-                "proto": protocol,
-                "service": svc_name,
-                "product": svc_prod,
-                "version": svc_ver,
-            })
+    open_ports = parsed["results"]
+    summary    = parsed["summary"]
+    os_guess   = parsed["os_guess"]
 
     # --- Section 1: Open Ports ---
     if not open_ports:
         _print(Colors.YELLOW, "[~]", "No open ports detected in this scan.")
     else:
-        print(f"  {Colors.BOLD}{'PORT':<8}{'PROTO':<7}{'SERVICE':<14}{'PRODUCT / VERSION'}{Colors.RESET}")
+        print(f"  {Colors.BOLD}{'PORT':<8}{'PROTO':<7}{'SERVICE':<14}{'VERSION'}{Colors.RESET}")
         print(f"  {'─'*8}{'─'*7}{'─'*14}{'─'*22}")
 
-        for p in sorted(open_ports, key=lambda x: x["port"]):
+        for p in open_ports:
             risk_color = _RISK_PRIORITY.get(p["port"], Colors.GREEN)
-            full_ver   = f"{p['product']} {p['version']}".strip() or "—"
+            ver_str    = p.get("version", "—") or "—"
             print(
                 f"  {risk_color}{Colors.BOLD}{p['port']:<8}{Colors.RESET}"
-                f"{Colors.DIM}{p['proto']:<7}{Colors.RESET}"
+                f"{Colors.DIM}{p['protocol']:<7}{Colors.RESET}"
                 f"{Colors.CYAN}{p['service']:<14}{Colors.RESET}"
-                f"{full_ver}"
+                f"{ver_str}"
             )
-
             note_tuple = _PORT_NOTES.get(p["port"])
             if note_tuple:
                 print(f"  {Colors.DIM}{'':8}{'':7}↳ Risk: {note_tuple[1]}{Colors.RESET}")
 
         print()
 
-    # --- Section 2: OS Detection ---
-    os_matches = root.findall(".//osmatch")
-    if os_matches:
-        best = max(os_matches, key=lambda x: int(x.get("accuracy", "0")))
-        accuracy = best.get("accuracy", "?")
-        os_name  = best.get("name", "Unknown")
-        print(f"  {Colors.BOLD}OS Guess :{Colors.RESET} {Colors.GREEN}{os_name}{Colors.RESET} "
-              f"{Colors.DIM}({accuracy}% confidence){Colors.RESET}")
-    else:
-        print(f"  {Colors.BOLD}OS Guess :{Colors.RESET} {Colors.DIM}Not available "
-              f"(run with -O or -A as root){Colors.RESET}")
+    # --- Section 2: Host & Network Info ---
+    status_color = Colors.GREEN if summary["host_status"] == "up" else Colors.RED
+    print(f"  {Colors.BOLD}Status   :{Colors.RESET} "
+          f"{status_color}{summary['host_status'].upper()}{Colors.RESET}  "
+          f"{Colors.DIM}latency: {summary['latency'] or 'n/a'}{Colors.RESET}")
+    print(f"  {Colors.BOLD}Ports    :{Colors.RESET} "
+          f"{Colors.GREEN}{summary['open_ports']} open{Colors.RESET}  "
+          f"{Colors.DIM}{summary['filtered_ports']} closed/filtered{Colors.RESET}")
 
-    # --- Section 3: Uptime ---
-    uptime_elem = root.find(".//uptime")
-    if uptime_elem is not None:
-        seconds   = int(uptime_elem.get("seconds", 0))
-        days      = seconds // 86400
-        hours     = (seconds % 86400) // 3600
-        last_boot = uptime_elem.get("lastboot", "")
-        uptime_str = f"{days}d {hours}h"
-        patch_note = (
-            f"{Colors.RED}  ← No recent reboot; patches may be missing!{Colors.RESET}"
-            if days > 7 else ""
-        )
-        print(f"  {Colors.BOLD}Uptime   :{Colors.RESET} {uptime_str}{patch_note}")
-        if last_boot:
-            print(f"  {Colors.BOLD}Last Boot:{Colors.RESET} {Colors.DIM}{last_boot}{Colors.RESET}")
+    # --- Section 3: OS Detection ---
+    if os_guess:
+        print(f"  {Colors.BOLD}OS Guess :{Colors.RESET} {Colors.GREEN}{os_guess['name']}{Colors.RESET} "
+              f"{Colors.DIM}({os_guess['accuracy']} confidence){Colors.RESET}")
     else:
-        print(f"  {Colors.BOLD}Uptime   :{Colors.RESET} {Colors.DIM}Not available{Colors.RESET}")
+        print(f"  {Colors.BOLD}OS Guess :{Colors.RESET} "
+              f"{Colors.DIM}Not available (use -O or -A with sudo){Colors.RESET}")
 
     # --- Section 4: First-Strike Recommendation ---
     print(f"\n  {Colors.BOLD}{'─'*48}{Colors.RESET}")
     _suggest_first_strike(open_ports)
 
     print(f"\n{border}\n")
+
+
+def _infer_scan_type(nmap_args: str) -> str:
+    """
+    Derive a human-readable scan type label from the Nmap argument string.
+
+    Args:
+        nmap_args: The raw Nmap flags string passed to run_nmap_scan.
+
+    Returns:
+        A snake_case label string, e.g. 'service_detection'.
+    """
+    a = nmap_args.lower()
+    if "--script vuln" in a:         return "vuln_scan"
+    if "-a" in a.split():            return "aggressive"
+    if "-sc" in a and "-sv" in a:    return "service_detection"
+    if "-sv" in a.split():           return "version_detection"
+    if "-su" in a.split():           return "udp_scan"
+    if "-ss" in a.split():           return "syn_scan"
+    if "-o" in a.split():            return "os_detection"
+    if "-p-" in a:                   return "full_port_scan"
+    if "-t4" in a.split():           return "quick_scan"
+    if "-f" in a.split():            return "firewall_bypass"
+    if "--script" in a:              return "script_scan"
+    if "-p" in a.split():            return "custom_port_scan"
+    return "simple_port_scan"
+
+
+def _parse_xml_to_structured(xml_str: str) -> dict:
+    """
+    Convert raw Nmap XML output into a clean, frontend-friendly dict.
+
+    XML is fully consumed here and never stored or surfaced to the user.
+    Only meaningful fields are extracted; all Nmap metadata noise is dropped.
+
+    Args:
+        xml_str: Raw Nmap XML string captured from stdout.
+
+    Returns:
+        A dict with keys:
+            results        – list of open port dicts
+            os_guess       – {name, accuracy} or None
+            summary        – {open_ports, filtered_ports, host_status, latency}
+    """
+    structured: dict = {
+        "results":  [],
+        "os_guess": None,
+        "summary": {
+            "open_ports":     0,
+            "filtered_ports": 0,
+            "host_status":    "unknown",
+            "latency":        None,
+        },
+    }
+
+    try:
+        tree = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return structured
+
+    for host in tree.findall("host"):
+
+        # ── Host status ──────────────────────────────────────────────────────
+        status_elem = host.find("status")
+        if status_elem is not None:
+            structured["summary"]["host_status"] = status_elem.get("state", "unknown")
+
+        # ── Latency (srtt is stored in microseconds by Nmap) ─────────────────
+        times_elem = host.find("times")
+        if times_elem is not None:
+            srtt = times_elem.get("srtt", "")
+            if srtt.isdigit():
+                structured["summary"]["latency"] = f"{round(int(srtt) / 1000, 2)}ms"
+
+        # ── Ports ────────────────────────────────────────────────────────────
+        ports_elem = host.find("ports")
+        if ports_elem is not None:
+
+            # Closed/filtered bulk counts from <extraports>
+            for extra in ports_elem.findall("extraports"):
+                if extra.get("state") in ("filtered", "closed"):
+                    structured["summary"]["filtered_ports"] += int(
+                        extra.get("count", 0)
+                    )
+
+            for port_elem in ports_elem.findall("port"):
+                state_elem = port_elem.find("state")
+                if state_elem is None:
+                    continue
+
+                state  = state_elem.get("state", "unknown")
+                reason = state_elem.get("reason", "")
+
+                if state != "open":
+                    continue
+
+                portid   = int(port_elem.get("portid", 0))
+                protocol = port_elem.get("protocol", "tcp")
+                svc_elem = port_elem.find("service")
+
+                svc_name = svc_elem.get("name", "unknown")    if svc_elem is not None else "unknown"
+                svc_prod = svc_elem.get("product", "")        if svc_elem is not None else ""
+                svc_ver  = svc_elem.get("version", "")        if svc_elem is not None else ""
+
+                port_entry: dict = {
+                    "port":     portid,
+                    "protocol": protocol,
+                    "service":  svc_name,
+                    "state":    state,
+                    "reason":   reason,
+                }
+                full_ver = f"{svc_prod} {svc_ver}".strip()
+                if full_ver:
+                    port_entry["version"] = full_ver
+
+                structured["results"].append(port_entry)
+
+        # ── OS Detection ─────────────────────────────────────────────────────
+        os_elem = host.find("os")
+        if os_elem is not None:
+            os_matches = os_elem.findall("osmatch")
+            if os_matches:
+                best = max(os_matches, key=lambda x: int(x.get("accuracy", "0")))
+                structured["os_guess"] = {
+                    "name":     best.get("name", "Unknown"),
+                    "accuracy": f"{best.get('accuracy', '?')}%",
+                }
+
+    # Sort by port number ascending
+    structured["results"].sort(key=lambda p: p["port"])
+    structured["summary"]["open_ports"] = len(structured["results"])
+
+    return structured
 
 
 def _suggest_first_strike(open_ports: list[dict]) -> None:
@@ -393,10 +485,11 @@ def run_nmap_scan(target: str, extra_args: str, scan_label: str = "Custom Scan")
     Execute an Nmap command, persist results, and emit structured logs.
 
     The function:
-    - Assigns a unique scan ID.
-    - Logs start/finish events that include the ID and summary outcome.
-    - Captures XML output for downstream parsing by 02_exploit_finder.py.
-    - Stores a structured entry in scan_results.json regardless of outcome.
+    - Assigns a unique scan ID and infers a scan type label.
+    - Logs start/finish events including the ID and open-port summary.
+    - Parses Nmap XML output internally via _parse_xml_to_structured();
+      raw XML is never stored or surfaced.
+    - Stores a clean, frontend-friendly JSON entry regardless of outcome.
 
     Args:
         target:     IP address or hostname to scan.
@@ -404,7 +497,7 @@ def run_nmap_scan(target: str, extra_args: str, scan_label: str = "Custom Scan")
         scan_label: Human-readable name for the scan type.
 
     Returns:
-        The scan result dict on success, None on failure.
+        The completed scan result dict on success, None on failure.
     """
     if not check_nmap_installed():
         _print(Colors.RED, "[!]", "'nmap' could not be found on this system.")
@@ -415,23 +508,31 @@ def run_nmap_scan(target: str, extra_args: str, scan_label: str = "Custom Scan")
 
     scan_id   = generate_scan_id()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scan_type = _infer_scan_type(extra_args)
     command   = ["nmap"] + extra_args.split() + ["-oX", "-", target]
 
-    # --- Log: scan started ---
-    logger.info("[ID:%s] Scanning started for %s | args: %s", scan_id, target, extra_args)
+    logger.info("[ID:%s] Scanning started for %s | type: %s | args: %s",
+                scan_id, target, scan_type, extra_args)
     _print(Colors.CYAN, "[*]", f"[ID:{scan_id}] {scan_label}  →  {Colors.BOLD}{target}{Colors.RESET}")
     _print(Colors.DIM,  "[>]", f"Command: {' '.join(command)}")
     print()
 
-    result_entry = {
-        "id":        scan_id,
-        "label":     scan_label,
+    # Base entry — populated with parsed results on success, error details on failure.
+    # xml_output is intentionally absent; XML stays internal to this function.
+    result_entry: dict = {
+        "scan_id":   scan_id,
         "target":    target,
-        "timestamp": timestamp,
-        "nmap_args": extra_args,
-        "command":   " ".join(command),
         "status":    "pending",
-        "xml_output": None,
+        "scan_type": scan_type,
+        "timestamp": timestamp,
+        "results":   [],
+        "os_guess":  None,
+        "summary":   {
+            "open_ports":     0,
+            "filtered_ports": 0,
+            "host_status":    "unknown",
+            "latency":        None,
+        },
         "error":     None,
     }
 
@@ -445,26 +546,24 @@ def run_nmap_scan(target: str, extra_args: str, scan_label: str = "Custom Scan")
         stdout, stderr = process.communicate()
 
         if process.returncode == 0:
-            result_entry["status"]     = "success"
-            result_entry["xml_output"] = stdout
+            # Parse XML once — result used for both JSON storage and terminal display
+            parsed = _parse_xml_to_structured(stdout)
+
+            result_entry["status"]   = "success"
+            result_entry["results"]  = parsed["results"]
+            result_entry["os_guess"] = parsed["os_guess"]
+            result_entry["summary"]  = parsed["summary"]
 
             _progress_bar(f"[ID:{scan_id}] Scan completed")
             _print(Colors.GREEN, "[+]", f"[ID:{scan_id}] Scan finished successfully for {target}.")
-
-            # Derive a compact summary for the log line
-            open_port_count = stdout.count("<state state=\"open\"")
-            summary = (
-                f"open_ports_found={open_port_count}"
-                if open_port_count >= 0
-                else "no summary available"
-            )
             logger.info(
-                "[ID:%s] Scanning finished for %s | status=success | %s",
-                scan_id, target, summary,
+                "[ID:%s] Scanning finished for %s | status=success | open_ports=%d | host=%s",
+                scan_id, target,
+                parsed["summary"]["open_ports"],
+                parsed["summary"]["host_status"],
             )
 
-            # Print inline pentester summary immediately after scan
-            print_quick_summary(scan_id, target, stdout)
+            print_quick_summary(scan_id, target, parsed)
 
         else:
             result_entry["status"] = "error"
@@ -478,7 +577,6 @@ def run_nmap_scan(target: str, extra_args: str, scan_label: str = "Custom Scan")
             )
 
     except FileNotFoundError:
-        # Nmap disappeared between the check and execution (edge case).
         result_entry["status"] = "error"
         result_entry["error"]  = "nmap binary not found at runtime"
         _print(Colors.RED, "[!]", "'nmap' disappeared unexpectedly. Is it still installed?")
